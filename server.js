@@ -1,54 +1,54 @@
 /**
- * Productboard Webhook Service
- * - On feature events, write the parent Product name into a Feature custom field
- * - FIELD_MODE: "singleSelect" (recommended) or "text"
- * - Auto-registers its own webhook on startup
- * - Backfill all features: `node server.js backfill`
+ * Productboard → Webhook: set Feature custom field to parent Product name
+ * FIELD_MODE: "singleSelect" | "text"
+ * Backfill: `node server.js backfill`
  */
 
 import express from "express";
 import fetch from "node-fetch";
-import pino from "pino";
 
-// ---------- Config ----------
-const log = pino({ level: process.env.LOG_LEVEL || "info" });
-
+// ================== Config ==================
 const PB_BASE = process.env.PB_BASE || "https://api.productboard.com";
-const PB_TOKEN = process.env.PB_TOKEN; // required
-const PB_CF_ID = process.env.PB_CUSTOM_FIELD_ID; // required
-const FIELD_MODE = process.env.FIELD_MODE || "singleSelect"; // "singleSelect" | "text"
+const PB_TOKEN = process.env.PB_TOKEN;                         // required
+const PB_CF_ID = process.env.PB_CUSTOM_FIELD_ID;               // required
+const FIELD_MODE = process.env.FIELD_MODE || "singleSelect";   // or "text"
 const PB_API_VERSION = process.env.PB_API_VERSION || "1";
 const WEBHOOK_URL =
   process.env.WEBHOOK_URL ||
   "https://productboardaustin-webhook.onrender.com/pb-webhook";
 const SHARED_SECRET = process.env.WEBHOOK_SHARED_SECRET || null;
+const SAFE_DEBUG = process.env.SAFE_DEBUG === "1";
 const PORT = process.env.PORT || 3000;
 
 if (!PB_TOKEN || !PB_CF_ID) {
   throw new Error("PB_TOKEN and PB_CUSTOM_FIELD_ID env vars are required.");
 }
 
-// ---------- PB HTTP helper ----------
+// =============== Express app FIRST ===============
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+// =============== PB HTTP helper =================
 async function pbFetch(path, init = {}) {
   const res = await fetch(`${PB_BASE}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${PB_TOKEN}`,
       "Content-Type": "application/json",
-      "X-Version": PB_API_VERSION, // required by PB API
+      "X-Version": PB_API_VERSION,
       ...(init.headers || {}),
     },
   });
-
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`PB ${init.method || "GET"} ${path} → ${res.status}: ${text}`);
   }
-  if (res.status === 204) return null;
-  return res.json();
+  return res.status === 204 ? null : res.json();
 }
 
-// ---------- PB entity helpers ----------
+// =============== PB helpers =====================
+const norm = (s) => (s || "").trim().toLowerCase();
+
 async function getFeature(id) {
   return pbFetch(`/features/${id}`);
 }
@@ -69,77 +69,48 @@ async function setCustomFieldValue({ featureId, customFieldId, value }) {
     body: JSON.stringify(body),
   });
 }
-
-// ---------- Single-select resolver ----------
-function norm(s) {
-  return (s || "").trim().toLowerCase();
-}
 async function resolveSingleSelectOptionId(cfId, productName) {
   const def = await getCustomFieldDefinition(cfId);
-  const opts = def?.options || [];
-  const target = norm(productName);
-  const hit = opts.find((o) => norm(o.label) === target);
-  if (!hit) {
-    throw new Error(
-      `No single-select option on ${cfId} matches product "${productName}".`
-    );
-  }
+  const hit = (def?.options || []).find((o) => norm(o.label) === norm(productName));
+  if (!hit) throw new Error(`No single-select option on ${cfId} for "${productName}".`);
   return hit.id;
 }
 
-// ---------- Core handler ----------
 async function handleFeatureEvent(featureId) {
   try {
     const feature = await getFeature(featureId);
     const productId = feature?.product?.id || feature?.parent?.product?.id;
-    if (!productId) {
-      log.warn({ featureId }, "Feature has no product — skipping.");
-      return;
-    }
+    if (!productId) return;
 
     const product = await getProduct(productId);
     const productName = product?.name;
     if (!productName) return;
 
     if (FIELD_MODE === "text") {
-      await setCustomFieldValue({
-        featureId,
-        customFieldId: PB_CF_ID,
-        value: productName,
-      });
-      log.info({ featureId, productName }, "Updated TEXT custom field");
+      await setCustomFieldValue({ featureId, customFieldId: PB_CF_ID, value: productName });
+      console.log("Updated TEXT field", { featureId, productName });
     } else {
       const optionId = await resolveSingleSelectOptionId(PB_CF_ID, productName);
-      await setCustomFieldValue({
-        featureId,
-        customFieldId: PB_CF_ID,
-        value: { optionId },
-      });
-      log.info({ featureId, productName, optionId }, "Updated SINGLE-SELECT field");
+      await setCustomFieldValue({ featureId, customFieldId: PB_CF_ID, value: { optionId } });
+      console.log("Updated SINGLE-SELECT field", { featureId, productName, optionId });
     }
-  } catch (err) {
-    log.error({ featureId, err: String(err) }, "Error handling feature event");
+  } catch (e) {
+    console.error("Error handling feature event", featureId, String(e));
   }
 }
 
-// ---------- Feature ID extraction ----------
-// --- extract a feature id from one event object ---
+// ========== Feature ID extraction & normalization ==========
 function extractFeatureIdFromEvent(e) {
   if (!e) return null;
+  const t = e.eventType || e.type || "";
 
-  // Common direct shapes
   if (e?.entity?.type === "feature" && e?.entity?.id) return e.entity.id;
-  if (e?.entityId && ((e?.eventType || e?.type || "").startsWith("feature.") || e?.entityType === "feature"))
-    return e.entityId;
-
-  // Alternate nesting
+  if (e?.entityId && (t.startsWith("feature.") || e?.entityType === "feature")) return e.entityId;
   if (e?.data?.entity?.type === "feature" && e?.data?.entity?.id) return e.data.entity.id;
-  if (e?.data?.id && (e?.eventType || e?.type || "").startsWith("feature.")) return e.data.id;
-
-  // Some integrations put ids like e.entity?.entity?.id
+  if (e?.data?.id && t.startsWith("feature.")) return e.data.id;
   if (e?.entity?.entity?.type === "feature" && e?.entity?.entity?.id) return e.entity.entity.id;
 
-  // Deep fallback: find any object that says type/entityType 'feature' and has a string id
+  // Deep fallback
   let found = null;
   (function walk(o) {
     if (!o || found) return;
@@ -147,30 +118,25 @@ function extractFeatureIdFromEvent(e) {
     if (typeof o === "object") {
       const maybeId = o.id || o.entityId;
       const maybeType = o.type || o.entityType;
-      if ((maybeType === "feature") && typeof maybeId === "string") {
+      if (maybeType === "feature" && typeof maybeId === "string") {
         found = maybeId;
         return;
       }
       for (const k of Object.keys(o)) walk(o[k]);
     }
   })(e);
-
   return found;
 }
 
-// Normalize to an array of event-like objects
 function normalizeEvents(body) {
   if (!body) return [];
-  // data: [ ... ]
-  if (Array.isArray(body.data)) return body.data;
-  // data: { events: [ ... ] }
-  if (Array.isArray(body?.data?.events)) return body.data.events;
-  // single event in data
-  if (body?.data && typeof body.data === "object") return [body.data];
-  // single event at root
-  return [body];
+  if (Array.isArray(body.data)) return body.data;              // { data: [ ... ] }
+  if (Array.isArray(body?.data?.events)) return body.data.events; // { data: { events: [...] } }
+  if (body?.data && typeof body.data === "object") return [body.data]; // { data: { ... } }
+  return [body];                                               // single event
 }
 
+// ================== Webhook route ==================
 app.post("/pb-webhook", async (req, res) => {
   try {
     if (SHARED_SECRET) {
@@ -178,14 +144,13 @@ app.post("/pb-webhook", async (req, res) => {
       if (incoming !== SHARED_SECRET) return res.status(401).send("unauthorized");
     }
 
-    const body = req.body;
-    const events = normalizeEvents(body);
-
+    const events = normalizeEvents(req.body);
     let handled = 0, ignored = 0;
+
     for (const evt of events) {
-      const eventType = evt?.eventType || evt?.type || "";
+      const et = evt?.eventType || evt?.type || "";
       const fid = extractFeatureIdFromEvent(evt);
-      if (fid && eventType.startsWith("feature.")) {
+      if (fid && et.startsWith("feature.")) {
         await handleFeatureEvent(fid);
         handled++;
       } else {
@@ -194,119 +159,57 @@ app.post("/pb-webhook", async (req, res) => {
     }
 
     if (handled === 0) {
-      // TEMP: safe debug to understand the payload shape
-      const debugEnabled = process.env.SAFE_DEBUG === "1";
       const first = events[0];
-      const preview = first ? JSON.stringify(first).slice(0, 800) : "";
-      log.warn(
+      const preview = first ? JSON.stringify(first).slice(0, 500) : "";
+      console.warn(
         {
-          topLevelKeys: Object.keys(body || {}),
-          dataType: Array.isArray(body?.data) ? "array" : typeof body?.data,
+          topLevelKeys: Object.keys(req.body || {}),
+          dataType: Array.isArray(req.body?.data) ? "array" : typeof req.body?.data,
           firstEventKeys: first ? Object.keys(first) : [],
           firstEventType: first?.eventType || first?.type,
-          preview: debugEnabled ? preview : "(enable SAFE_DEBUG=1 to print preview)"
+          preview: SAFE_DEBUG ? preview : "(set SAFE_DEBUG=1 to print preview)"
         },
-        "⚠️ No featureId extracted from webhook payload"
+        "No featureId extracted"
       );
     } else {
-      log.info({ handled, ignored }, "Processed webhook events");
+      console.log("Processed webhook events", { handled, ignored });
     }
 
     res.status(200).send("ok");
   } catch (err) {
-    log.error({ err: String(err) }, "Webhook error");
+    console.error("Webhook error", String(err));
     res.status(200).send("handled");
   }
 });
 
-
-// ---------- Express app ----------
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-
-app.post("/pb-webhook", async (req, res) => {
-  try {
-    if (SHARED_SECRET) {
-      const incoming = req.headers["x-shared-secret"];
-      if (incoming !== SHARED_SECRET) return res.status(401).send("unauthorized");
-    }
-
-    const body = req.body;
-
-    // Case A: batched payload -> { data: [events...] }
-    if (Array.isArray(body?.data)) {
-      let handled = 0, ignored = 0;
-      for (const evt of body.data) {
-        const et = evt?.eventType || "";
-        const fid = extractFeatureIdFromEvent(evt);
-        if (fid && et.startsWith("feature.")) {
-          await handleFeatureEvent(fid);
-          handled++;
-        } else {
-          ignored++;
-        }
-      }
-      log.info({ handled, ignored }, "Processed batched webhook events");
-      return res.status(200).send("ok");
-    }
-
-    // Case B: single event (older shapes)
-    const fid =
-      extractFeatureIdFromEvent(body) ||
-      extractFeatureIdFromEvent(body?.data);
-    if (!fid) {
-      log.warn(
-        { topLevelKeys: Object.keys(body || {}), sample: body?.data?.[0]?.eventType || body?.eventType },
-        "⚠️ Ignored webhook with no featureId"
-      );
-      return res.status(200).send("ignored");
-    }
-
-    await handleFeatureEvent(fid);
-    res.status(200).send("ok");
-  } catch (err) {
-    log.error({ err: String(err) }, "Webhook error");
-    res.status(200).send("handled");
-  }
-});
-
-// ---------- Auto-register webhook ----------
+// ================== Auto-register webhook ==================
 async function ensureWebhook() {
   try {
-    log.info("🔍 Checking Productboard webhook registration...");
+    console.log("Checking Productboard webhook registration...");
     const list = await pbFetch("/webhooks");
     const existing = list?.data?.find((w) => w.notification?.url === WEBHOOK_URL);
-
     if (existing) {
-      log.info({ id: existing.id }, "✅ Webhook already registered");
+      console.log("Webhook already registered", { id: existing.id });
       return;
     }
-
-    log.info("🪄 Creating webhook...");
+    console.log("Creating webhook...");
     const created = await pbFetch("/webhooks", {
       method: "POST",
       body: JSON.stringify({
         data: {
           name: "Auto: Product field updater",
-          events: [
-            { eventType: "feature.created" },
-            { eventType: "feature.updated" }
-          ],
-          notification: {
-            url: WEBHOOK_URL,
-            version: 1 // required
-          }
+          events: [{ eventType: "feature.created" }, { eventType: "feature.updated" }],
+          notification: { url: WEBHOOK_URL, version: 1 }
         }
       })
     });
-
-    log.info({ id: created?.data?.id }, "🎉 Webhook created");
-  } catch (err) {
-    log.error({ err: String(err) }, "Error ensuring webhook");
+    console.log("Webhook created", { id: created?.data?.id });
+  } catch (e) {
+    console.error("Error ensuring webhook", String(e));
   }
 }
 
-// ---------- Backfill (optional CLI) ----------
+// ================== Backfill CLI ==================
 async function listFeaturesPage(limit = 200, cursor = null) {
   const qs = new URLSearchParams();
   qs.set("limit", String(limit));
@@ -314,12 +217,11 @@ async function listFeaturesPage(limit = 200, cursor = null) {
   return pbFetch(`/features?${qs.toString()}`);
 }
 async function backfillAllFeatures() {
-  log.info("Starting backfill...");
-  let cursor = null;
-  let processed = 0;
+  console.log("Starting backfill…");
+  let cursor = null, processed = 0;
   do {
     const page = await listFeaturesPage(200, cursor);
-    const items = page.items || page.data || page; // tolerate shapes
+    const items = page.items || page.data || page;
     for (const f of items) {
       if (!f?.id) continue;
       await handleFeatureEvent(f.id);
@@ -327,17 +229,17 @@ async function backfillAllFeatures() {
     }
     cursor = page.nextCursor || page?.meta?.nextCursor || null;
   } while (cursor);
-  log.info({ processed }, "Backfill complete");
+  console.log("Backfill complete", { processed });
 }
 
-// ---------- Start ----------
+// ================== Start ==================
 if (process.argv[2] === "backfill") {
   backfillAllFeatures().catch((e) => {
-    log.fatal(String(e));
+    console.error(e);
     process.exit(1);
   });
 } else {
-  ensureWebhook().finally(() => {
-    app.listen(PORT, () => log.info(`🚀 Listening on port ${PORT}`));
-  });
+  await ensureWebhook();                // ensure before listening
+  app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
 }
+
