@@ -1,21 +1,10 @@
 /**
  * Productboard Webhook Service
  *
- * Goal: Whenever a Feature is created/updated/moved, look up its parent Product
- * and write the Product name into a Feature custom field (either Text or Single-select).
- *
- * Runtime: Node.js 18+
- * Dependencies: express, node-fetch (v3), pino
- *
- * ENV VARS (required):
- *   PB_TOKEN                 → Productboard personal access token or service token
- *   PB_CUSTOM_FIELD_ID       → your target Feature custom field ID
- *   FIELD_MODE               → "text" or "singleSelect"
- *   SINGLE_SELECT_MATCH_MODE → "case-insensitive" (recommended)
- *
- * Webhook subscription:
- *   Subscribe to: feature.created, feature.updated, feature.moved
- *   URL: https://your-render-app.onrender.com/pb-webhook
+ * - Listens for feature events (created, updated, moved)
+ * - Looks up each feature's parent product
+ * - Updates a custom field (Text or Single Select) with the product name
+ * - Auto-registers its own Productboard webhook at startup
  */
 
 import express from "express";
@@ -24,37 +13,47 @@ import pino from "pino";
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
+// --- CONFIG ---
 const PB_BASE = process.env.PB_BASE || "https://api.productboard.com";
 const PB_TOKEN = process.env.PB_TOKEN;
 const PB_CF_ID = process.env.PB_CUSTOM_FIELD_ID;
 const FIELD_MODE = process.env.FIELD_MODE || "text";
 const MATCH_MODE = process.env.SINGLE_SELECT_MATCH_MODE || "case-insensitive";
+const PB_API_VERSION = process.env.PB_API_VERSION || "1";
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "https://productboardaustin-webhook.onrender.com/pb-webhook";
 const PORT = process.env.PORT || 3000;
 
+// --- VALIDATION ---
 if (!PB_TOKEN || !PB_CF_ID) {
-  throw new Error("PB_TOKEN and PB_CUSTOM_FIELD_ID are required env vars.");
+  throw new Error("❌ Missing required env vars: PB_TOKEN or PB_CUSTOM_FIELD_ID");
 }
 
-const PB_API_VERSION = process.env.PB_API_VERSION || "1";
+// --- EXPRESS APP ---
+const app = express();
+app.use(express.json({ limit: "1mb" }));
 
+// --- PRODUCTBOARD API HELPER ---
 async function pbFetch(path, init = {}) {
   const res = await fetch(`${PB_BASE}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${PB_TOKEN}`,
       "Content-Type": "application/json",
-      "X-Version": PB_API_VERSION,          // 👈 REQUIRED
+      "X-Version": PB_API_VERSION,
       ...(init.headers || {}),
     },
   });
+
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`PB ${init.method || "GET"} ${path} → ${res.status}: ${text}`);
   }
+
   if (res.status === 204) return null;
   return res.json();
 }
 
+// --- HELPERS ---
 async function getFeature(id) {
   return pbFetch(`/features/${id}`);
 }
@@ -98,98 +97,92 @@ async function resolveSingleSelectOptionId(cfId, productName) {
 }
 
 async function handleFeatureEvent(featureId) {
-  const feature = await getFeature(featureId);
-  const productId = feature?.product?.id || feature?.parent?.product?.id;
+  try {
+    const feature = await getFeature(featureId);
+    const productId = feature?.product?.id || feature?.parent?.product?.id;
+    if (!productId) {
+      log.warn({ featureId }, "No product found — skipping.");
+      return;
+    }
 
-  if (!productId) {
-    log.warn({ featureId }, "No product found — skipping.");
-    return;
-  }
+    const product = await getProduct(productId);
+    const productName = product?.name;
+    if (!productName) return;
 
-  const product = await getProduct(productId);
-  const productName = product?.name;
-  if (!productName) return;
-
-  if (FIELD_MODE === "text") {
-    await setCustomFieldValue({
-      entityId: featureId,
-      customFieldId: PB_CF_ID,
-      value: productName,
-    });
-    log.info({ featureId, productName }, "Updated text field.");
-  } else if (FIELD_MODE === "singleSelect") {
-    const optionId = await resolveSingleSelectOptionId(PB_CF_ID, productName);
-    await setCustomFieldValue({
-      entityId: featureId,
-      customFieldId: PB_CF_ID,
-      value: { optionId },
-    });
-    log.info({ featureId, productName, optionId }, "Updated single-select field.");
+    if (FIELD_MODE === "text") {
+      await setCustomFieldValue({
+        entityId: featureId,
+        customFieldId: PB_CF_ID,
+        value: productName,
+      });
+      log.info({ featureId, productName }, "✅ Updated text field");
+    } else if (FIELD_MODE === "singleSelect") {
+      const optionId = await resolveSingleSelectOptionId(PB_CF_ID, productName);
+      await setCustomFieldValue({
+        entityId: featureId,
+        customFieldId: PB_CF_ID,
+        value: { optionId },
+      });
+      log.info({ featureId, productName, optionId }, "✅ Updated single-select field");
+    }
+  } catch (err) {
+    log.error({ featureId, err: String(err) }, "❌ Error handling feature event");
   }
 }
 
+// --- WEBHOOK ROUTE ---
 app.post("/pb-webhook", async (req, res) => {
   try {
     const event = req.body;
     const featureId = event?.entity?.id || event?.entityId;
     if (!featureId) {
-      log.warn({ body: event }, "No feature ID found in webhook payload.");
+      log.warn("⚠️ Ignored webhook with no featureId");
       return res.status(200).send("ignored");
     }
     await handleFeatureEvent(featureId);
     res.status(200).send("ok");
   } catch (err) {
-    log.error({ err: String(err) }, "Webhook error");
+    log.error({ err: String(err) }, "❌ Webhook error");
     res.status(200).send("handled");
   }
 });
 
-// --- Auto-register webhook on startup ---
+// --- AUTO REGISTER WEBHOOK ---
 async function ensureWebhook() {
   try {
-    log.info("Checking Productboard webhook registration...");
+    log.info("🔍 Checking Productboard webhook registration...");
     const res = await pbFetch("/webhooks");
-    const existing = res?.data?.find(
-      (w) => w.notification?.url === "https://productboardaustin-webhook.onrender.com/pb-webhook"
-    );
+    const existing = res?.data?.find((w) => w.notification?.url === WEBHOOK_URL);
 
     if (existing) {
-      log.info({ id: existing.id }, "Webhook already registered ✅");
+      log.info({ id: existing.id }, "✅ Webhook already registered");
       return;
     }
 
-    log.info("Webhook not found, creating new one...");
-    const body = {
-      data: {
-        name: "Auto: Product field updater",
-        enabled: true,
-        events: [
-          { eventType: "feature.created" },
-          { eventType: "feature.updated" },
-          { eventType: "feature.moved" }
-        ],
-        notification: {
-          url: "https://productboardaustin-webhook.onrender.com/pb-webhook",
-          method: "POST"
-        }
-      }
-    };
-
+    log.info("🪄 Webhook not found — creating new one...");
     const create = await pbFetch("/webhooks", {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        data: {
+          name: "Auto: Product field updater",
+          enabled: true,
+          events: [
+            { eventType: "feature.created" },
+            { eventType: "feature.updated" },
+            { eventType: "feature.moved" }
+          ],
+          notification: { url: WEBHOOK_URL, method: "POST" }
+        },
+      }),
     });
 
-    log.info({ id: create?.data?.id }, "Webhook created successfully 🎉");
+    log.info({ id: create?.data?.id }, "🎉 Webhook created successfully");
   } catch (err) {
-    log.error({ err: String(err) }, "Error ensuring webhook");
+    log.error({ err: String(err) }, "❌ Error ensuring webhook");
   }
 }
 
-// Call the function during startup
-ensureWebhook().then(() => {
-  app.listen(PORT, () => log.info(`Listening on port ${PORT}`));
+// --- STARTUP ---
+ensureWebhook().finally(() => {
+  app.listen(PORT, () => log.info(`🚀 Listening on port ${PORT}`));
 });
-
-
-app.listen(PORT, () => log.info(`Listening on port ${PORT}`));
