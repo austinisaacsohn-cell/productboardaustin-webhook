@@ -15,7 +15,7 @@ const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const PB_BASE = process.env.PB_BASE || "https://api.productboard.com";
 const PB_TOKEN = process.env.PB_TOKEN; // required
-const PB_CF_ID = process.env.PB_CUSTOM_FIELD_ID; // required (your custom field id)
+const PB_CF_ID = process.env.PB_CUSTOM_FIELD_ID; // required
 const FIELD_MODE = process.env.FIELD_MODE || "singleSelect"; // "singleSelect" | "text"
 const PB_API_VERSION = process.env.PB_API_VERSION || "1";
 const WEBHOOK_URL =
@@ -28,7 +28,7 @@ if (!PB_TOKEN || !PB_CF_ID) {
   throw new Error("PB_TOKEN and PB_CUSTOM_FIELD_ID env vars are required.");
 }
 
-// ---------- HTTP helper for Productboard API ----------
+// ---------- PB HTTP helper ----------
 async function pbFetch(path, init = {}) {
   const res = await fetch(`${PB_BASE}${path}`, {
     ...init,
@@ -122,15 +122,17 @@ async function handleFeatureEvent(featureId) {
   }
 }
 
-// ---------- Extract featureId from various payload shapes ----------
-function extractFeatureId(evt) {
-  if (evt?.entity?.type === "feature" && evt?.entity?.id) return evt.entity.id;
-  if (evt?.entityId && ((evt?.type || "").startsWith("feature.") || evt?.entityType === "feature"))
-    return evt.entityId;
-  if (evt?.data?.entity?.type === "feature" && evt?.data?.entity?.id) return evt.data.entity.id;
-  if (evt?.data?.id && (evt?.type || "").startsWith("feature.")) return evt.data.id;
+// ---------- Feature ID extraction ----------
+function extractFeatureIdFromEvent(e) {
+  if (!e) return null;
+  // common shapes
+  if (e?.entity?.type === "feature" && e?.entity?.id) return e.entity.id;
+  if (e?.entityId && ((e?.eventType || "").startsWith("feature.") || e?.entityType === "feature"))
+    return e.entityId;
+  if (e?.data?.entity?.type === "feature" && e?.data?.entity?.id) return e.data.entity.id;
+  if (e?.data?.id && (e?.eventType || "").startsWith("feature.")) return e.data.id;
 
-  // Deep walk as a fallback
+  // deep fallback
   let found = null;
   (function walk(o) {
     if (!o || found) return;
@@ -142,8 +144,7 @@ function extractFeatureId(evt) {
       }
       for (const k of Object.keys(o)) walk(o[k]);
     }
-  })(evt);
-
+  })(e);
   return found;
 }
 
@@ -158,18 +159,38 @@ app.post("/pb-webhook", async (req, res) => {
       if (incoming !== SHARED_SECRET) return res.status(401).send("unauthorized");
     }
 
-    const event = req.body;
-    const featureId = extractFeatureId(event);
+    const body = req.body;
 
-    if (!featureId) {
+    // Case A: batched payload -> { data: [events...] }
+    if (Array.isArray(body?.data)) {
+      let handled = 0, ignored = 0;
+      for (const evt of body.data) {
+        const et = evt?.eventType || "";
+        const fid = extractFeatureIdFromEvent(evt);
+        if (fid && et.startsWith("feature.")) {
+          await handleFeatureEvent(fid);
+          handled++;
+        } else {
+          ignored++;
+        }
+      }
+      log.info({ handled, ignored }, "Processed batched webhook events");
+      return res.status(200).send("ok");
+    }
+
+    // Case B: single event (older shapes)
+    const fid =
+      extractFeatureIdFromEvent(body) ||
+      extractFeatureIdFromEvent(body?.data);
+    if (!fid) {
       log.warn(
-        { type: event?.type, topLevelKeys: Object.keys(event || {}) },
+        { topLevelKeys: Object.keys(body || {}), sample: body?.data?.[0]?.eventType || body?.eventType },
         "⚠️ Ignored webhook with no featureId"
       );
       return res.status(200).send("ignored");
     }
 
-    await handleFeatureEvent(featureId);
+    await handleFeatureEvent(fid);
     res.status(200).send("ok");
   } catch (err) {
     log.error({ err: String(err) }, "Webhook error");
@@ -177,7 +198,7 @@ app.post("/pb-webhook", async (req, res) => {
   }
 });
 
-// ---------- Auto-register webhook on startup ----------
+// ---------- Auto-register webhook ----------
 async function ensureWebhook() {
   try {
     log.info("🔍 Checking Productboard webhook registration...");
@@ -201,7 +222,7 @@ async function ensureWebhook() {
           ],
           notification: {
             url: WEBHOOK_URL,
-            version: 1 // required by PB
+            version: 1 // required
           }
         }
       })
