@@ -185,3 +185,66 @@ async function ensureWebhook() {
     const existing = list?.data?.find((w) => w.notification?.url === WEBHOOK_URL);
 
     if (existing) {
+      log.info({ id: existing.id }, "✅ Webhook already registered");
+      return;
+    }
+
+    log.info("🪄 Creating webhook...");
+    const created = await pbFetch("/webhooks", {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          name: "Auto: Product field updater",
+          events: [
+            { eventType: "feature.created" },
+            { eventType: "feature.updated" }
+          ],
+          notification: {
+            url: WEBHOOK_URL,
+            version: 1 // required by PB
+          }
+        }
+      })
+    });
+
+    log.info({ id: created?.data?.id }, "🎉 Webhook created");
+  } catch (err) {
+    log.error({ err: String(err) }, "Error ensuring webhook");
+  }
+}
+
+// ---------- Backfill (optional CLI) ----------
+async function listFeaturesPage(limit = 200, cursor = null) {
+  const qs = new URLSearchParams();
+  qs.set("limit", String(limit));
+  if (cursor) qs.set("cursor", cursor);
+  return pbFetch(`/features?${qs.toString()}`);
+}
+async function backfillAllFeatures() {
+  log.info("Starting backfill...");
+  let cursor = null;
+  let processed = 0;
+  do {
+    const page = await listFeaturesPage(200, cursor);
+    const items = page.items || page.data || page; // tolerate shapes
+    for (const f of items) {
+      if (!f?.id) continue;
+      await handleFeatureEvent(f.id);
+      processed++;
+    }
+    cursor = page.nextCursor || page?.meta?.nextCursor || null;
+  } while (cursor);
+  log.info({ processed }, "Backfill complete");
+}
+
+// ---------- Start ----------
+if (process.argv[2] === "backfill") {
+  backfillAllFeatures().catch((e) => {
+    log.fatal(String(e));
+    process.exit(1);
+  });
+} else {
+  ensureWebhook().finally(() => {
+    app.listen(PORT, () => log.info(`🚀 Listening on port ${PORT}`));
+  });
+}
