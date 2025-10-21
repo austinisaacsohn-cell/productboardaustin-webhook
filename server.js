@@ -123,30 +123,102 @@ async function handleFeatureEvent(featureId) {
 }
 
 // ---------- Feature ID extraction ----------
+// --- extract a feature id from one event object ---
 function extractFeatureIdFromEvent(e) {
   if (!e) return null;
-  // common shapes
-  if (e?.entity?.type === "feature" && e?.entity?.id) return e.entity.id;
-  if (e?.entityId && ((e?.eventType || "").startsWith("feature.") || e?.entityType === "feature"))
-    return e.entityId;
-  if (e?.data?.entity?.type === "feature" && e?.data?.entity?.id) return e.data.entity.id;
-  if (e?.data?.id && (e?.eventType || "").startsWith("feature.")) return e.data.id;
 
-  // deep fallback
+  // Common direct shapes
+  if (e?.entity?.type === "feature" && e?.entity?.id) return e.entity.id;
+  if (e?.entityId && ((e?.eventType || e?.type || "").startsWith("feature.") || e?.entityType === "feature"))
+    return e.entityId;
+
+  // Alternate nesting
+  if (e?.data?.entity?.type === "feature" && e?.data?.entity?.id) return e.data.entity.id;
+  if (e?.data?.id && (e?.eventType || e?.type || "").startsWith("feature.")) return e.data.id;
+
+  // Some integrations put ids like e.entity?.entity?.id
+  if (e?.entity?.entity?.type === "feature" && e?.entity?.entity?.id) return e.entity.entity.id;
+
+  // Deep fallback: find any object that says type/entityType 'feature' and has a string id
   let found = null;
   (function walk(o) {
     if (!o || found) return;
     if (Array.isArray(o)) return o.forEach(walk);
     if (typeof o === "object") {
-      if ((o.type === "feature" || o.entityType === "feature") && typeof o.id === "string") {
-        found = o.id;
+      const maybeId = o.id || o.entityId;
+      const maybeType = o.type || o.entityType;
+      if ((maybeType === "feature") && typeof maybeId === "string") {
+        found = maybeId;
         return;
       }
       for (const k of Object.keys(o)) walk(o[k]);
     }
   })(e);
+
   return found;
 }
+
+// Normalize to an array of event-like objects
+function normalizeEvents(body) {
+  if (!body) return [];
+  // data: [ ... ]
+  if (Array.isArray(body.data)) return body.data;
+  // data: { events: [ ... ] }
+  if (Array.isArray(body?.data?.events)) return body.data.events;
+  // single event in data
+  if (body?.data && typeof body.data === "object") return [body.data];
+  // single event at root
+  return [body];
+}
+
+app.post("/pb-webhook", async (req, res) => {
+  try {
+    if (SHARED_SECRET) {
+      const incoming = req.headers["x-shared-secret"];
+      if (incoming !== SHARED_SECRET) return res.status(401).send("unauthorized");
+    }
+
+    const body = req.body;
+    const events = normalizeEvents(body);
+
+    let handled = 0, ignored = 0;
+    for (const evt of events) {
+      const eventType = evt?.eventType || evt?.type || "";
+      const fid = extractFeatureIdFromEvent(evt);
+      if (fid && eventType.startsWith("feature.")) {
+        await handleFeatureEvent(fid);
+        handled++;
+      } else {
+        ignored++;
+      }
+    }
+
+    if (handled === 0) {
+      // TEMP: safe debug to understand the payload shape
+      const debugEnabled = process.env.SAFE_DEBUG === "1";
+      const first = events[0];
+      const preview = first ? JSON.stringify(first).slice(0, 800) : "";
+      log.warn(
+        {
+          topLevelKeys: Object.keys(body || {}),
+          dataType: Array.isArray(body?.data) ? "array" : typeof body?.data,
+          firstEventKeys: first ? Object.keys(first) : [],
+          firstEventType: first?.eventType || first?.type,
+          preview: debugEnabled ? preview : "(enable SAFE_DEBUG=1 to print preview)"
+        },
+        "⚠️ No featureId extracted from webhook payload"
+      );
+    } else {
+      log.info({ handled, ignored }, "Processed webhook events");
+    }
+
+    res.status(200).send("ok");
+  } catch (err) {
+    log.error({ err: String(err) }, "Webhook error");
+    res.status(200).send("handled");
+  }
+});
+
 
 // ---------- Express app ----------
 const app = express();
