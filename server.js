@@ -64,10 +64,10 @@ async function setCustomFieldValue({ featureId, customFieldId, value }) {
     customField: { id: customFieldId },
     value,
   };
-  return pbFetch(`/hierarchy-entities/custom-fields-values/value`, {
-    method: "PUT",
-    body: JSON.stringify(body),
-  });
+return pbFetch(`/custom-fields-values`, {
+  method: "PUT",
+  body: JSON.stringify({ data: [body] }),
+});
 }
 async function resolveSingleSelectOptionId(cfId, productName) {
   const def = await getCustomFieldDefinition(cfId);
