@@ -160,22 +160,22 @@ async function ensureWebhook() {
     }
 
     log.info("🪄 Webhook not found — creating new one...");
-    const create = await pbFetch("/webhooks", {
-      method: "POST",
-      body: JSON.stringify({
-        data: {
-          name: "Auto: Product field updater",
-          enabled: true,
-          events: [
-            { eventType: "feature.created" },
-            { eventType: "feature.updated" },
-            { eventType: "feature.moved" }
-          ],
-          notification: { url: WEBHOOK_URL, method: "POST" }
-        },
-      }),
-    });
-
+   const create = await pbFetch("/webhooks", {
+  method: "POST",
+  body: JSON.stringify({
+    data: {
+      name: "Auto: Product field updater",
+      events: [
+        { eventType: "feature.created" },
+        { eventType: "feature.updated" }
+      ],
+      notification: {
+        url: WEBHOOK_URL,
+        version: 1            // 👈 required
+      }
+    }
+  })
+});
     log.info({ id: create?.data?.id }, "🎉 Webhook created successfully");
   } catch (err) {
     log.error({ err: String(err) }, "❌ Error ensuring webhook");
