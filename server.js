@@ -35,8 +35,7 @@ if (!PB_TOKEN || !PB_CF_ID) {
   throw new Error("PB_TOKEN and PB_CUSTOM_FIELD_ID are required env vars.");
 }
 
-const app = express();
-app.use(express.json({ limit: "1mb" }));
+const PB_API_VERSION = process.env.PB_API_VERSION || "1";
 
 async function pbFetch(path, init = {}) {
   const res = await fetch(`${PB_BASE}${path}`, {
@@ -44,6 +43,7 @@ async function pbFetch(path, init = {}) {
     headers: {
       Authorization: `Bearer ${PB_TOKEN}`,
       "Content-Type": "application/json",
+      "X-Version": PB_API_VERSION,          // 👈 REQUIRED
       ...(init.headers || {}),
     },
   });
