@@ -59,22 +59,34 @@ async function getCustomFieldDefinition(cfId) {
   return pbFetch(`/custom-fields/${cfId}`);
 }
 async function setCustomFieldValue({ featureId, customFieldId, value }) {
-  const body = {
+  const item = {
     hierarchyEntity: { type: "feature", id: featureId },
     customField: { id: customFieldId },
-    value,
+    value
   };
-return pbFetch(`/custom-fields-values`, {
-  method: "PUT",
-  body: JSON.stringify({ data: [body] }),
-});
+
+  // Bulk-safe endpoint (works for text + single select)
+  try {
+    const res = await pbFetch(`/custom-fields-values`, {
+      method: "PUT",
+      body: JSON.stringify({ data: [item] }),
+    });
+    console.log("PB custom field update OK", {
+      featureId,
+      customFieldId,
+      returnedItems: Array.isArray(res?.data) ? res.data.length : undefined
+    });
+    return res;
+  } catch (e) {
+    console.error("PB custom field update FAILED", {
+      featureId,
+      customFieldId,
+      value
+    }, String(e));
+    throw e;
+  }
 }
-async function resolveSingleSelectOptionId(cfId, productName) {
-  const def = await getCustomFieldDefinition(cfId);
-  const hit = (def?.options || []).find((o) => norm(o.label) === norm(productName));
-  if (!hit) throw new Error(`No single-select option on ${cfId} for "${productName}".`);
-  return hit.id;
-}
+
 
 async function handleFeatureEvent(featureId) {
   try {
