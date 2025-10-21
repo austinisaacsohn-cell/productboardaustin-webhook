@@ -104,6 +104,17 @@ function extractFeatureIdFromEvent(e) {
   if (!e) return null;
   const t = e.eventType || e.type || "";
 
+  // New: direct id on feature.* events
+  if (typeof e.id === "string" && t.startsWith("feature.")) return e.id;
+
+  // New: parse from links.target .../features/{id}
+  const target = e?.links?.target || e?.data?.links?.target;
+  if (typeof target === "string") {
+    const m = target.match(/\/features\/([0-9a-f-]{20,})$/i);
+    if (m) return m[1];
+  }
+
+  // Common shapes
   if (e?.entity?.type === "feature" && e?.entity?.id) return e.entity.id;
   if (e?.entityId && (t.startsWith("feature.") || e?.entityType === "feature")) return e.entityId;
   if (e?.data?.entity?.type === "feature" && e?.data?.entity?.id) return e.data.entity.id;
@@ -127,6 +138,7 @@ function extractFeatureIdFromEvent(e) {
   })(e);
   return found;
 }
+
 
 function normalizeEvents(body) {
   if (!body) return [];
