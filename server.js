@@ -144,4 +144,52 @@ app.post("/pb-webhook", async (req, res) => {
   }
 });
 
+// --- Auto-register webhook on startup ---
+async function ensureWebhook() {
+  try {
+    log.info("Checking Productboard webhook registration...");
+    const res = await pbFetch("/webhooks");
+    const existing = res?.data?.find(
+      (w) => w.notification?.url === "https://productboardaustin-webhook.onrender.com/pb-webhook"
+    );
+
+    if (existing) {
+      log.info({ id: existing.id }, "Webhook already registered ✅");
+      return;
+    }
+
+    log.info("Webhook not found, creating new one...");
+    const body = {
+      data: {
+        name: "Auto: Product field updater",
+        enabled: true,
+        events: [
+          { eventType: "feature.created" },
+          { eventType: "feature.updated" },
+          { eventType: "feature.moved" }
+        ],
+        notification: {
+          url: "https://productboardaustin-webhook.onrender.com/pb-webhook",
+          method: "POST"
+        }
+      }
+    };
+
+    const create = await pbFetch("/webhooks", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+
+    log.info({ id: create?.data?.id }, "Webhook created successfully 🎉");
+  } catch (err) {
+    log.error({ err: String(err) }, "Error ensuring webhook");
+  }
+}
+
+// Call the function during startup
+ensureWebhook().then(() => {
+  app.listen(PORT, () => log.info(`Listening on port ${PORT}`));
+});
+
+
 app.listen(PORT, () => log.info(`Listening on port ${PORT}`));
